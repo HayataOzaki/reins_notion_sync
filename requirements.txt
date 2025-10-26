@@ -1,0 +1,5 @@
+selenium
+notion-client
+python-dotenv
+httpx
+pandas
