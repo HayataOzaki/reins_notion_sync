@@ -7,8 +7,7 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
-
-from notion_client import Client
+import requests
 
 LOGGER = logging.getLogger("notion")
 
@@ -22,36 +21,52 @@ class NotionSearchJob:
 
 
 class NotionIntegration:
-    """High level helper around the Notion SDK."""
+    """High level helper around the Notion SDK (Notion API direct version)."""
 
     def __init__(self, token: str, search_db_id: str, property_db_id: str) -> None:
-        self.client = Client(auth=token)
+        self.token = token
         self.search_db_id = search_db_id
         self.property_db_id = property_db_id
+
+        self.headers = {
+            "Authorization": f"Bearer {self.token}",
+            "Content-Type": "application/json",
+            "Notion-Version": "2022-06-28",
+        }
 
     # ------------------------------------------------------------------
     # Search jobs
     # ------------------------------------------------------------------
     def fetch_pending_search_jobs(self) -> List[NotionSearchJob]:
-        response = self.client.databases.query(
-            database_id=self.search_db_id,
-            filter={
+        """Fetch Notion rows where 検索対象 = True"""
+        url = f"https://api.notion.com/v1/databases/{self.search_db_id}/query"
+        payload = {
+            "filter": {
                 "property": "検索対象",
-                "checkbox": {"equals": True},
-            },
-        )
+                "checkbox": {"equals": True}
+            }
+        }
+
+        response = requests.post(url, headers=self.headers, json=payload)
+        response.raise_for_status()
+
+        results = response.json().get("results", [])
         jobs: List[NotionSearchJob] = []
-        for row in response.get("results", []):
+        for row in results:
             jobs.append(
                 NotionSearchJob(
                     page_id=row["id"],
                     properties=self._simplify_properties(row.get("properties", {})),
                 )
             )
+
         LOGGER.info("Found %d pending search job(s)", len(jobs))
         return jobs
 
     def mark_search_job_complete(self, job: NotionSearchJob, property_ids: Sequence[str]) -> None:
+        """Mark job complete and link properties."""
+        url = f"https://api.notion.com/v1/pages/{job.page_id}"
+
         properties: Dict[str, object] = {
             "検索対象": {"checkbox": False},
         }
@@ -59,7 +74,9 @@ class NotionIntegration:
             properties["物件"] = {
                 "relation": [{"id": pid} for pid in property_ids]
             }
-        self.client.pages.update(page_id=job.page_id, properties=properties)
+
+        response = requests.patch(url, headers=self.headers, json={"properties": properties})
+        response.raise_for_status()
         LOGGER.info("Marked search job %s as complete (linked %d properties)", job.page_id, len(property_ids))
 
     # ------------------------------------------------------------------
@@ -77,14 +94,19 @@ class NotionIntegration:
 
         if page_id:
             LOGGER.info("Updating existing property %s", property_number)
-            updated = self.client.pages.update(page_id=page_id, properties=notion_properties)
+            url = f"https://api.notion.com/v1/pages/{page_id}"
+            response = requests.patch(url, headers=self.headers, json={"properties": notion_properties})
         else:
             LOGGER.info("Creating property %s", property_number)
-            updated = self.client.pages.create(
-                parent={"database_id": self.property_db_id},
-                properties=notion_properties,
-            )
-            page_id = updated["id"]
+            url = "https://api.notion.com/v1/pages"
+            payload = {
+                "parent": {"database_id": self.property_db_id},
+                "properties": notion_properties,
+            }
+            response = requests.post(url, headers=self.headers, json=payload)
+        response.raise_for_status()
+        result = response.json()
+        page_id = result["id"]
 
         if pdf_path and page_id:
             self._upload_pdf(page_id, pdf_path)
@@ -127,37 +149,18 @@ class NotionIntegration:
 
         title = str(data.get("物件名") or data.get("所在地") or "不明な物件")
         properties["物件名"] = {
-            "title": [
-                {
-                    "type": "text",
-                    "text": {"content": title[:2000]},
-                }
-            ]
+            "title": [{"type": "text", "text": {"content": title[:2000]}}],
         }
 
-        text_fields = [
-            "物件番号",
-            "所在地",
-            "間取り",
-            "交通",
-        ]
+        text_fields = ["物件番号", "所在地", "間取り", "交通"]
         for field in text_fields:
             value = data.get(field)
             if value:
                 properties[field] = {
-                    "rich_text": [
-                        {
-                            "type": "text",
-                            "text": {"content": str(value)[:2000]},
-                        }
-                    ]
+                    "rich_text": [{"type": "text", "text": {"content": str(value)[:2000]}}]
                 }
 
-        number_fields = [
-            "賃料",
-            "管理費",
-            "面積",
-        ]
+        number_fields = ["賃料", "管理費", "面積"]
         for field in number_fields:
             value = data.get(field)
             if value is not None:
@@ -167,10 +170,7 @@ class NotionIntegration:
                     continue
                 properties[field] = {"number": number}
 
-        date_fields = [
-            "登録年月日",
-            "築年月",
-        ]
+        date_fields = ["登録年月日", "築年月"]
         for field in date_fields:
             value = data.get(field)
             if not value:
@@ -191,49 +191,54 @@ class NotionIntegration:
             return None
 
     def _find_property_by_number(self, property_number: str) -> Optional[str]:
-        response = self.client.databases.query(
-            database_id=self.property_db_id,
-            filter={
+        url = f"https://api.notion.com/v1/databases/{self.property_db_id}/query"
+        payload = {
+            "filter": {
                 "property": "物件番号",
-                "rich_text": {"equals": property_number},
+                "rich_text": {"equals": property_number}
             },
-            page_size=1,
-        )
-        results = response.get("results", [])
+            "page_size": 1
+        }
+
+        response = requests.post(url, headers=self.headers, json=payload)
+        response.raise_for_status()
+
+        results = response.json().get("results", [])
         return results[0]["id"] if results else None
 
     def _upload_pdf(self, page_id: str, pdf_path: Path) -> None:
         try:
             with pdf_path.open("rb") as fp:
-                file_response = self.client.files.upload(fp, filename=pdf_path.name)
+                files = {"file": (pdf_path.name, fp, "application/pdf")}
+                response = requests.post(
+                    "https://api.notion.com/v1/files",
+                    headers={"Authorization": f"Bearer {self.token}", "Notion-Version": "2022-06-28"},
+                    files=files
+                )
+                response.raise_for_status()
+                file_response = response.json()
         except Exception as exc:
             LOGGER.warning("Failed to upload PDF for %s: %s", page_id, exc)
             return
 
-        file_info = file_response.get(file_response.get("type", ""), {}) if isinstance(file_response, dict) else {}
-        url = file_info.get("url")
-        expiry = file_info.get("expiry_time")
+        url = file_response.get("file", {}).get("url")
         if not url:
             LOGGER.warning("Upload response missing URL for %s", page_id)
             return
 
-        self.client.pages.update(
-            page_id=page_id,
-            properties={
+        update_url = f"https://api.notion.com/v1/pages/{page_id}"
+        payload = {
+            "properties": {
                 "図面ファイル": {
-                    "files": [
-                        {
-                            "type": "file",
-                            "name": pdf_path.name,
-                            "file": {
-                                "url": url,
-                                "expiry_time": expiry,
-                            },
-                        }
-                    ]
+                    "files": [{
+                        "type": "external",
+                        "name": pdf_path.name,
+                        "external": {"url": url}
+                    }]
                 }
-            },
-        )
+            }
+        }
+        requests.patch(update_url, headers=self.headers, json=payload)
         try:
             pdf_path.unlink()
             if not any(pdf_path.parent.iterdir()):
