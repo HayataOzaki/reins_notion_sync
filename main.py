@@ -58,6 +58,7 @@ def main() -> None:
 
     with ReinsScraper(credentials) as scraper:
         scraper.login()
+        scraper.go_to_rental_search()
         for job in jobs:
             try:
                 process_search_job(job, scraper, mapper, notion)
