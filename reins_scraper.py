@@ -308,6 +308,7 @@ class ReinsScraper:
         self._reset_form()
 
         for field, value in conditions.items():
+            LOGGER.info("Setting condition '%s' to %r", field, value)
             self._apply_condition(field, value)
 
     def run_search(self, max_results: int = 50) -> List[ReinsSearchResult]:
@@ -548,6 +549,16 @@ class ReinsScraper:
                     LOGGER.debug("Located field '%s' via label keywords %s", field, keywords)
                     return element
 
+            for keywords in label_groups:
+                element = self._find_element_by_attribute_keywords(keywords)
+                if element:
+                    LOGGER.debug(
+                        "Located field '%s' via attribute keywords %s (JS search)",
+                        field,
+                        keywords,
+                    )
+                    return element
+
             time.sleep(0.3)
 
         raise TimeoutException(f"フィールド '{field}' の入力欄が見つかりませんでした。") from last_error
@@ -576,6 +587,91 @@ class ReinsScraper:
                 element = self._locate_control_from_label(label)
                 if element:
                     return element
+        return None
+
+    def _find_element_by_attribute_keywords(
+        self, keywords: Sequence[str]
+    ) -> Optional[WebElement]:
+        usable_keywords = [kw for kw in keywords if kw]
+        if not usable_keywords:
+            return None
+
+        script = r"""
+            const keywords = arguments[0];
+            const attrNames = [
+                'placeholder',
+                'aria-label',
+                'name',
+                'id',
+                'title',
+                'data-testid',
+                'data-label',
+                'data-column',
+                'data-field'
+            ];
+
+            function normalize(text) {
+                if (!text) return '';
+                return text.replace(/\s+/g, ' ').trim();
+            }
+
+            function matchesText(text) {
+                if (!text) return false;
+                return keywords.every((kw) => normalize(text).includes(kw));
+            }
+
+            function isVisible(el) {
+                if (!el) return false;
+                const style = window.getComputedStyle(el);
+                return style.display !== 'none' && style.visibility !== 'hidden';
+            }
+
+            function checkElement(el) {
+                if (!el) return false;
+                for (const attr of attrNames) {
+                    if (matchesText(el.getAttribute(attr))) {
+                        return true;
+                    }
+                }
+
+                const label = el.closest('label');
+                if (label && matchesText(label.innerText)) {
+                    return true;
+                }
+
+                let sibling = el.previousElementSibling;
+                for (let i = 0; i < 3 && sibling; i += 1) {
+                    if (matchesText(sibling.innerText)) {
+                        return true;
+                    }
+                    sibling = sibling.previousElementSibling;
+                }
+
+                const parent = el.parentElement;
+                if (parent && matchesText(parent.innerText)) {
+                    return true;
+                }
+
+                return false;
+            }
+
+            const elements = Array.from(document.querySelectorAll('input, select, textarea'));
+            for (const el of elements) {
+                if (!isVisible(el)) continue;
+                if (checkElement(el)) {
+                    return el;
+                }
+            }
+            return null;
+        """
+
+        try:
+            element = self.driver.execute_script(script, usable_keywords)
+        except Exception:
+            return None
+
+        if isinstance(element, WebElement):
+            return element
         return None
 
     def _locate_control_from_label(self, label: WebElement) -> Optional[WebElement]:
