@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import logging
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
 
 import httpx
+from selenium.common.exceptions import TimeoutException
 from selenium.webdriver import Chrome, ChromeOptions
 from selenium.webdriver.common.by import By
 from selenium.webdriver.remote.webdriver import WebDriver
@@ -170,7 +172,19 @@ class ReinsScraper:
         if not target:
             raise RuntimeError("賃貸 物件検索ボタンが見つかりませんでした。")
 
+        before_handles = list(self.driver.window_handles)
         self.driver.execute_script("arguments[0].click();", target)
+
+        try:
+            WebDriverWait(self.driver, 10).until(
+                lambda d: len(d.window_handles) > len(before_handles)
+            )
+            LOGGER.debug("Detected new window after navigating to search page")
+        except TimeoutException:
+            LOGGER.debug("No new window detected after navigation; continuing on current handle")
+
+        self._switch_to_latest_window()
+        self._focus_search_form_context()
 
         # 検索フォーム待機
         try:
@@ -188,6 +202,7 @@ class ReinsScraper:
     def set_conditions(self, conditions: Dict[str, object]) -> None:
         """検索条件を設定。Notion→REINSマッピングで対応。"""
         LOGGER.info("Applying %d search conditions", len(conditions))
+        self._focus_search_form_context()
         self._reset_form()
 
         for field, value in conditions.items():
@@ -196,6 +211,7 @@ class ReinsScraper:
     def run_search(self, max_results: int = 50) -> List[ReinsSearchResult]:
         """検索実行 → 詳細抽出 → PDF保存。"""
         LOGGER.info("Executing search...")
+        self._focus_search_form_context()
         buttons = self.wait.until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, "button.btn.p-button")))
         search_button = None
         for b in buttons:
@@ -237,6 +253,64 @@ class ReinsScraper:
     # ------------------------------------------------------------------
     # HELPERS
     # ------------------------------------------------------------------
+    def _switch_to_latest_window(self) -> None:
+        try:
+            handles = self.driver.window_handles
+        except Exception:
+            return
+        if not handles:
+            return
+        current = self.driver.current_window_handle
+        latest = handles[-1]
+        if current != latest:
+            LOGGER.debug("Switching from window %s to %s", current, latest)
+            self.driver.switch_to.window(latest)
+
+    def _focus_search_form_context(self, timeout: int = 15) -> None:
+        """検索フォームが含まれるウィンドウ/フレームへフォーカス。"""
+        target_selector = "input[placeholder='駅名']"
+
+        def search_in_frames(depth: int = 0) -> bool:
+            if depth > 5:
+                return False
+            frames = self.driver.find_elements(By.TAG_NAME, "iframe")
+            for frame in frames:
+                try:
+                    self.driver.switch_to.frame(frame)
+                except Exception:
+                    continue
+                if self.driver.find_elements(By.CSS_SELECTOR, target_selector):
+                    return True
+                if search_in_frames(depth + 1):
+                    return True
+                try:
+                    self.driver.switch_to.parent_frame()
+                except Exception:
+                    self.driver.switch_to.default_content()
+            return False
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                self.driver.switch_to.default_content()
+            except Exception:
+                pass
+
+            if self.driver.find_elements(By.CSS_SELECTOR, target_selector):
+                return
+
+            if search_in_frames():
+                LOGGER.debug("Switched into frame containing search form")
+                return
+
+            time.sleep(0.5)
+
+        try:
+            self.driver.switch_to.default_content()
+        except Exception:
+            pass
+        raise TimeoutException("検索フォームが見つからず、フレームの切替に失敗しました。")
+
     def _apply_condition(self, field: str, value: object) -> None:
         """フィールド名→CSSマッピング。必要に応じて拡張。"""
         selector_map = {
