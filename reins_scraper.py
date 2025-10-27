@@ -56,7 +56,7 @@ class ReinsScraper:
         credentials: ReinsCredentials,
         driver: Optional[WebDriver] = None,
         *,
-        headless: bool = True,
+        headless: bool = False,
         wait_timeout: int = 30,
     ) -> None:
         self.credentials = credentials
