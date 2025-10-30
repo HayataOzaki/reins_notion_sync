@@ -1,92 +1,77 @@
-"""Utilities for loading and transforming mapping definitions between Notion and REINS."""
+"""Utilities for mapping between Notion properties and REINS fields without external CSV."""
 
 from __future__ import annotations
 
+import datetime as dt
 from dataclasses import dataclass
-from functools import lru_cache
-from pathlib import Path
 from typing import Dict, List, Optional
-
-import pandas as pd
 
 
 @dataclass(frozen=True)
 class SearchMapping:
-    """Represents a mapping from a Notion search column to a REINS form field."""
-
     notion_column: str
     reins_field: str
     input_type: str
-    notes: str
-
-    @classmethod
-    def from_series(cls, series: pd.Series) -> "SearchMapping":
-        return cls(
-            notion_column=str(series["Notion列名"]).strip(),
-            reins_field=str(series["REINS項目"]).strip(),
-            input_type=str(series["入力方式"]).strip(),
-            notes=str(series.get("備考", "") or "")
-        )
+    transform: str = ""
 
 
 @dataclass(frozen=True)
 class PropertyMapping:
-    """Represents a mapping from a REINS property detail element to a Notion property field."""
-
     reins_element: str
     notion_field: str
     transform: str
-    notes: str
 
-    @classmethod
-    def from_series(cls, series: pd.Series) -> "PropertyMapping":
-        return cls(
-            reins_element=str(series["REINS要素"]).strip(),
-            notion_field=str(series["Notionカラム"]).strip(),
-            transform=str(series["変換"]).strip(),
-            notes=str(series.get("変換内容", "") or ""),
-        )
+
+SEARCH_MAPPINGS: List[SearchMapping] = [
+    SearchMapping("登録日", "登録日", "select"),
+    SearchMapping("物件種別", "物件種別", "select"),
+    SearchMapping("物件種目", "物件種目", "select"),
+    SearchMapping("沿線名", "沿線名", "text"),
+    SearchMapping("駅名(始点)", "駅名(始点)", "text"),
+    SearchMapping("駅名(終点)", "駅名(終点)", "text"),
+    SearchMapping("駅より徒歩(分)", "駅より徒歩(分)", "input"),
+    SearchMapping("都道府県", "都道府県", "text"),
+    SearchMapping("市区町村", "市区町村", "text"),
+    SearchMapping("使用部分面積(㎡)下限", "使用部分面積(㎡)下限", "input"),
+    SearchMapping("所在階(下限)", "所在階(下限)", "input"),
+    SearchMapping("所在階(上限)", "所在階(上限)", "input"),
+    SearchMapping("賃料上限(万円)", "賃料上限(万円)", "input"),
+    SearchMapping("新築フラグ", "新築フラグ", "checkbox"),
+    SearchMapping("築年数(上限)", "築年数上限", "select", "max_age"),
+    SearchMapping("部屋数(下限)", "部屋数(下限)", "input"),
+    SearchMapping("角部屋フラグ", "角部屋フラグ", "checkbox"),
+    SearchMapping("バルコニー方向", "バルコニー方向", "select"),
+    SearchMapping("駐車場の有無", "駐車場の有無", "select"),
+    SearchMapping("ペット可", "ペット可", "checkbox"),
+]
+
+PROPERTY_MAPPINGS: List[PropertyMapping] = [
+    PropertyMapping("物件番号", "物件番号", ""),
+    PropertyMapping("登録年月日", "登録年月日", "和暦日付"),
+    # 追加項目があればここに定義
+]
 
 
 class DataMapper:
-    """Loads mapping CSV files and exposes handy lookup helpers."""
-
-    def __init__(self, base_path: Optional[Path] = None) -> None:
-        self.base_path = Path(base_path or Path(__file__).resolve().parent)
-
-    @property
-    @lru_cache(maxsize=1)
-    def search_mappings(self) -> List[SearchMapping]:
-        csv_path = self.base_path / "data" / "notion_search_to_reins.csv"
-        df = pd.read_csv(csv_path)
-        return [SearchMapping.from_series(row) for _, row in df.iterrows()]
-
-    @property
-    @lru_cache(maxsize=1)
-    def property_mappings(self) -> List[PropertyMapping]:
-        csv_path = self.base_path / "data" / "reins_property_to_notion.csv"
-        df = pd.read_csv(csv_path)
-        return [PropertyMapping.from_series(row) for _, row in df.iterrows()]
+    """Provides in-code mapping definitions between Notion and REINS."""
 
     def get_reins_field(self, notion_column: str) -> Optional[SearchMapping]:
         notion_column = notion_column.strip()
-        for mapping in self.search_mappings:
+        for mapping in SEARCH_MAPPINGS:
             if mapping.notion_column == notion_column:
                 return mapping
         return None
 
     def get_notion_field(self, reins_element: str) -> Optional[PropertyMapping]:
         reins_element = reins_element.strip()
-        for mapping in self.property_mappings:
+        for mapping in PROPERTY_MAPPINGS:
             if mapping.reins_element == reins_element:
                 return mapping
         return None
 
     def normalize_search_conditions(self, row: Dict[str, object]) -> Dict[str, object]:
-        """Normalize a Notion search row into REINS form field values."""
-
         normalized: Dict[str, object] = {}
-        for mapping in self.search_mappings:
+        for mapping in SEARCH_MAPPINGS:
             value = row.get(mapping.notion_column)
             if value in (None, ""):
                 continue
@@ -94,10 +79,8 @@ class DataMapper:
         return normalized
 
     def map_property_details(self, details: Dict[str, str]) -> Dict[str, object]:
-        """Normalize REINS property details into Notion payload."""
-
         normalized: Dict[str, object] = {}
-        for mapping in self.property_mappings:
+        for mapping in PROPERTY_MAPPINGS:
             value = details.get(mapping.reins_element)
             if value in (None, ""):
                 continue
@@ -108,27 +91,36 @@ class DataMapper:
         return normalized
 
     def _normalize_value(self, mapping: SearchMapping, value: object) -> object:
+        if mapping.transform == "max_age":
+            return self._convert_max_age_to_year(value)
         if mapping.input_type == "input" and isinstance(value, str):
             return _normalize_numeric(value)
-        if mapping.input_type == "text":
-            return str(value).strip()
-        if mapping.input_type == "select":
+        if mapping.input_type in {"text", "select"}:
             return str(value).strip()
         if mapping.input_type == "checkbox":
             return bool(value)
         return value
 
     def _normalize_property_value(self, mapping: PropertyMapping, value: str) -> object:
-        transform = mapping.transform
-        if transform == "通貨":
+        if mapping.transform == "通貨":
             return convert_currency_to_yen(value)
-        if transform in {"和暦日付", "年月"}:
+        if mapping.transform in {"和暦日付", "年月"}:
             return convert_japanese_date(value)
-        if transform == "面積":
+        if mapping.transform == "面積":
             return _normalize_numeric(value)
-        if transform == "pdf":
+        if mapping.transform == "pdf":
             return value
         return value.strip()
+
+    def _convert_max_age_to_year(self, value: object) -> Optional[str]:
+        try:
+            years = int(float(str(value).strip()))
+        except (TypeError, ValueError):
+            return None
+        current_year = dt.date.today().year
+        target_year = current_year - max(years, 0)
+        # REINS側の選択肢は西暦値なので文字列として返す
+        return str(target_year)
 
 
 def _normalize_numeric(raw: object) -> Optional[float]:

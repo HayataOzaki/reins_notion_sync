@@ -4,16 +4,17 @@ from __future__ import annotations
 
 import logging
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence
 
 import httpx
 from selenium.webdriver import Chrome, ChromeOptions
 from selenium.webdriver.common.by import By
 from selenium.webdriver.remote.webdriver import WebDriver
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support.ui import Select, WebDriverWait
 
 LOGGER = logging.getLogger("scraper")
 
@@ -34,6 +35,56 @@ RENTAL_SEARCH_BUTTON_SELECTOR = "button.btn.p-button.btn-primary.btn-block.px-0"
 # 検索ページの主たるコントロール
 SEARCH_BUTTON_TEXT = "検索"
 DETAIL_BUTTON_SELECTOR = "button.btn.p-button.m-0.py-0.btn-outline.btn-block.px-0"
+RENTAL_SEARCH_URL_FRAGMENT = "GBK001310"
+
+# フィールドマッピング（ラベルベース）
+FIELD_CONFIG: Dict[str, Dict[str, object]] = {
+    "物件種別": {"label": "物件種別１", "type": "select"},
+    "物件種目": {"label": "物件種目１", "type": "select"},
+    "バルコニー方向": {"label": "バルコニー方向/採光面方向", "type": "select"},
+    "使用部分面積(㎡)下限": {"label": "建物使用部分面積", "type": "text", "index": 0},
+    "都道府県": {"label": "都道府県名", "type": "text", "occurrence": 0},
+    "市区町村": {"label": "所在地名１", "type": "text"},
+    "所在階(下限)": {"label": "所在階", "type": "text", "index": 0},
+    "所在階(上限)": {"label": "所在階", "type": "text", "index": 1},
+    "賃料上限(万円)": {"label": "賃料", "type": "text", "index": 1},
+    "部屋数(下限)": {"label": "間取部屋数", "type": "text", "index": 0},
+    "沿線名": {"label": "沿線名", "type": "text", "occurrence": 0, "index": 0},
+    "駅名(始点)": {"label": "駅名", "type": "text", "occurrence": 0, "index": 0},
+    "駅名(終点)": {"label": "駅名", "type": "text", "occurrence": 0, "index": 1},
+    "駅より徒歩(分)": {
+        "label": "駅から徒歩",
+        "type": "text",
+        "occurrence": 0,
+        "index": 0,
+        "unit_index": 0,
+    },
+    "築年": {"label": "築年月", "type": "select", "index": 0},
+    "駐車場の有無": {"label": "駐車場の有無", "type": "select"},
+}
+
+RADIO_OPTIONS: Dict[str, Dict[str, str]] = {
+    "登録日": {
+        "指定なし": "指定なし(全期間)",
+        "全期間": "指定なし(全期間)",
+        "当日": "当日",
+        "前日": "前日",
+        "3日以内": "３日以内",
+        "３日以内": "３日以内",
+        "1週間以内": "１週間以内",
+        "１週間以内": "１週間以内",
+        "一週間以内": "１週間以内",
+        "1ヶ月以内": "１ヶ月以内",
+        "１ヶ月以内": "１ヶ月以内",
+        "一ヶ月以内": "１ヶ月以内",
+        "日付を指定": "日付を指定",
+    }
+}
+
+CHECKBOX_CONFIG: Dict[str, Dict[str, object]] = {
+    "新築": {"label": "新築"},
+    "角部屋": {"label": "角部屋"},
+}
 
 
 @dataclass
@@ -93,7 +144,11 @@ class ReinsScraper:
             input_pw = self.driver.find_element(By.ID, LOGIN_PW_INPUT_ID)
         except Exception:
             # 予防：name/type でフォールバック（環境差異向け）
-            self.wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='text'], input[type='password']")))
+            self.wait.until(
+                EC.presence_of_element_located(
+                    (By.CSS_SELECTOR, "input[type='text'], input[type='password']")
+                )
+            )
             inputs = self.driver.find_elements(By.CSS_SELECTOR, "input[type='text']")
             pwds = self.driver.find_elements(By.CSS_SELECTOR, "input[type='password']")
             if not inputs or not pwds:
@@ -105,6 +160,7 @@ class ReinsScraper:
         input_id.send_keys(self.credentials.username)
         input_pw.clear()
         input_pw.send_keys(self.credentials.password)
+        time.sleep(0.8)
 
         # 規約チェック（Vue対策: JSで checked + イベントを発火）
         LOGGER.info("Clicking terms checkbox...")
@@ -130,15 +186,23 @@ class ReinsScraper:
         if login_btn.get_attribute("disabled"):
             self.driver.execute_script("arguments[0].removeAttribute('disabled');", login_btn)
 
-        # クリック
+        # 少し待ってからクリック
+        time.sleep(1.2)
         self.driver.execute_script("arguments[0].click();", login_btn)
+        time.sleep(0.6)
         LOGGER.info("Clicked login button")
 
-        # ページロード完了を待機
+        # ログイン後メニューの出現を待機（賃貸 物件検索ボタン）
+        post_login_locator = (
+            By.XPATH,
+            "//button[contains(@class,'btn') and contains(@class,'p-button') "
+            "and contains(normalize-space(.),'賃貸') and contains(normalize-space(.),'物件検索')]",
+        )
         try:
-            self.wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "div#app")))
-        except Exception:
-            self.wait.until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, "button.btn.p-button")))
+            WebDriverWait(self.driver, 12).until(EC.element_to_be_clickable(post_login_locator))
+        except TimeoutException:
+            self._dump_dom("login_post_timeout")
+            raise RuntimeError("ログイン後のメニューが表示されませんでした。")
 
         LOGGER.info("✅ Logged into REINS successfully")
 
@@ -148,38 +212,91 @@ class ReinsScraper:
     def go_to_rental_search(self) -> None:
         """トップから『賃貸 物件検索』ボタンを押下して検索画面へ遷移。"""
         LOGGER.info("Navigating to 賃貸 物件検索")
-        self.wait.until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, RENTAL_SEARCH_BUTTON_SELECTOR)))
-        buttons = self.driver.find_elements(By.CSS_SELECTOR, RENTAL_SEARCH_BUTTON_SELECTOR)
+        button_locators = [
+            (
+                By.XPATH,
+                "//button[contains(@class,'btn') and contains(@class,'p-button') "
+                "and contains(normalize-space(.),'賃貸') and contains(normalize-space(.),'物件検索')]",
+            ),
+            (By.CSS_SELECTOR, "button.btn.p-button.btn-primary.btn-block.px-0"),
+        ]
 
         target = None
-        for b in buttons:
-            txt = (b.text or "").strip()
-            if "賃貸" in txt and "物件検索" in txt:
-                target = b
-                break
+        for locator in button_locators:
+            try:
+                target = WebDriverWait(self.driver, 10).until(EC.element_to_be_clickable(locator))
+                if target:
+                    break
+            except TimeoutException:
+                continue
 
         if not target:
-            # 端UI向けフォールバック
-            all_buttons = self.driver.find_elements(By.CSS_SELECTOR, "button.btn")
-            for b in all_buttons:
-                txt = (b.text or "").strip()
-                if "賃貸" in txt and "物件検索" in txt:
-                    target = b
+            candidates = []
+            for b in self.driver.find_elements(By.CSS_SELECTOR, "button"):
+                text = (b.text or "").strip()
+                if text:
+                    candidates.append(text)
+            raise RuntimeError("賃貸 物件検索ボタンが見つかりませんでした。候補: %s" % candidates)
+
+        def attempt_click(button) -> bool:
+            try:
+                self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", button)
+            except Exception:
+                pass
+            time.sleep(0.2)
+            try:
+                button.click()
+            except Exception:
+                try:
+                    self.driver.execute_script("arguments[0].click();", button)
+                except Exception:
+                    return False
+            time.sleep(0.25)
+            return True
+
+        header_locator = (
+            By.XPATH,
+            "//h1[contains(normalize-space(),'賃貸検索条件入力')]",
+        )
+        label_locator = (
+            By.XPATH,
+            "//span[contains(@class,'p-label-title') and contains(normalize-space(),'物件種別')]",
+        )
+
+        success = False
+        for attempt in range(4):
+            if attempt > 0:
+                try:
+                    target = WebDriverWait(self.driver, 4).until(EC.element_to_be_clickable(button_locators[0]))
+                except TimeoutException:
+                    try:
+                        target = WebDriverWait(self.driver, 4).until(EC.element_to_be_clickable(button_locators[1]))
+                    except TimeoutException:
+                        target = None
+                if target is None:
                     break
 
-        if not target:
-            raise RuntimeError("賃貸 物件検索ボタンが見つかりませんでした。")
+            if not attempt_click(target):
+                continue
 
-        self.driver.execute_script("arguments[0].click();", target)
+            try:
+                WebDriverWait(self.driver, 3).until(EC.presence_of_element_located(header_locator))
+                WebDriverWait(self.driver, 3).until(EC.presence_of_element_located(label_locator))
+                success = True
+                break
+            except TimeoutException:
+                LOGGER.debug("Search form not detected after click attempt %d; retrying", attempt + 1)
+                continue
 
-        # 検索フォーム待機
-        try:
-            self.wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "input[placeholder='駅名']")))
-            LOGGER.info("✅ Search form loaded successfully")
-        except Exception:
-            self.wait.until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, "button.btn.p-button")))
-            LOGGER.warning("⚠️ Search form not found by '駅名' placeholder, fallback wait used")
+        if not success:
+            LOGGER.debug("Search form still not detected after retries; collecting diagnostic DOM")
+            self._dump_dom("search_form_error")
+            try:
+                WebDriverWait(self.driver, 10).until(EC.presence_of_element_located(label_locator))
+            except TimeoutException:
+                raise RuntimeError("賃貸検索フォームが表示されませんでした。")
 
+        LOGGER.info("✅ Search form loaded successfully")
         LOGGER.info("✅ Arrived at 賃貸 物件検索 page")
 
     # ------------------------------------------------------------------
@@ -238,58 +355,328 @@ class ReinsScraper:
     # HELPERS
     # ------------------------------------------------------------------
     def _apply_condition(self, field: str, value: object) -> None:
-        """フィールド名→CSSマッピング。必要に応じて拡張。"""
-        selector_map = {
-            "駅名": "input[placeholder='駅名']",
-            "賃料下限": "input[name='rentMin']",
-            "賃料上限": "input[name='rentMax']",
-            "間取部屋数": "select[name='layoutMin']",
-            "駅徒歩": "input[name='walkMinutes']",
-            "駐車場在否": "select[name='parking']",
-        }
-        selector = selector_map.get(field)
-        if not selector or value in (None, ""):
-            LOGGER.debug("No selector mapping or empty value for %s", field)
+        """フィールド名に応じて検索条件を入力する。"""
+        if value in (None, ""):
+            LOGGER.debug("Empty value for %s, skipping", field)
             return
 
-        element = self.wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, selector)))
-        tag_name = (element.tag_name or "").lower()
+        key = FIELD_ALIASES.get(field, field)
 
-        if tag_name == "select":
-            from selenium.webdriver.support.ui import Select
+        # ラジオボタン（登録年月日など）
+        if key in RADIO_OPTIONS:
+            self._apply_radio_option(key, value)
+            return
 
-            Select(element).select_by_visible_text(str(value))
+        # チェックボックス
+        checkbox_cfg = CHECKBOX_CONFIG.get(key)
+        if checkbox_cfg:
+            self._apply_checkbox_option(checkbox_cfg, value, key)
+            return
+
+        config = FIELD_CONFIG.get(key)
+        if not config:
+            LOGGER.debug("No mapping defined for '%s'", key)
+            return
+
+        element = self._locate_field_element(key, config)
+        if element is None:
+            LOGGER.warning("Field '%s' could not be located; skipping value %s", key, value)
+            self._dump_dom(f"missing_field_{key}")
+            return
+
+        field_type = config.get("type", "text")
+        if field_type == "select":
+            self._select_option(element, value, key)
         else:
             element.clear()
             element.send_keys(self._format_input_value(value))
 
+        if config.get("unit_index") is not None:
+            label = config.get("label", key)
+            occurrence = config.get("occurrence", 0)
+            self._set_walk_unit(label, occurrence, config.get("unit_index", 0))
+
     def _reset_form(self) -> None:
         """主要項目を初期化。"""
-        selectors = {
-            "input[placeholder='駅名']": "text",
-            "input[name='rentMin']": "text",
-            "input[name='rentMax']": "text",
-            "input[name='walkMinutes']": "text",
-            "select[name='layoutMin']": "select",
-            "select[name='parking']": "select",
-        }
-        for selector, kind in selectors.items():
-            try:
-                element = self.driver.find_element(By.CSS_SELECTOR, selector)
-            except Exception:
+        for key, config in FIELD_CONFIG.items():
+            element = self._locate_field_element(key, config, wait=False)
+            if element is None:
                 continue
-            if kind == "text":
-                element.clear()
+            tag = (element.tag_name or "").lower()
+            field_type = config.get("type", "text")
+            if field_type == "select" or tag == "select":
+                try:
+                    Select(element).select_by_index(0)
+                except Exception:
+                    continue
             else:
-                from selenium.webdriver.support.ui import Select
-
-                Select(element).select_by_index(0)
+                try:
+                    element.clear()
+                except Exception:
+                    continue
+            if config.get("unit_index") is not None:
+                label = config.get("label", key)
+                occurrence = config.get("occurrence", 0)
+                self._set_walk_unit(label, occurrence, config.get("unit_index", 0))
 
     @staticmethod
     def _format_input_value(value: object) -> str:
         if isinstance(value, float) and value.is_integer():
             return str(int(value))
         return str(value)
+
+    def _locate_field_element(self, key: str, config: Dict[str, object], *, wait: bool = True):
+        selectors = config.get("selectors")
+        if selectors:
+            element = self._find_element_by_selectors(selectors, wait=wait)
+            if element is not None:
+                return element
+
+        label = config.get("label", key)
+        tag = config.get("tag")
+        if not tag:
+            tag = "select" if config.get("type") == "select" else "input"
+        occurrence = config.get("occurrence", 0)
+        index = config.get("index", 0)
+        try:
+            return self._find_input_by_label(label, tag=tag, occurrence=occurrence, index=index, wait=wait)
+        except Exception:
+            return None
+
+    def _find_element_by_selectors(self, selectors: Optional[Sequence[str]], wait: bool = True):
+        if not selectors:
+            return None
+        for css in selectors:
+            try:
+                if wait:
+                    return self.wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, css)))
+                return self.driver.find_element(By.CSS_SELECTOR, css)
+            except Exception:
+                continue
+        return None
+
+    def _select_option(self, element, value: object, field: str) -> None:
+        select = Select(element)
+        text_value = str(value).strip()
+        try:
+            select.select_by_visible_text(text_value)
+            return
+        except Exception:
+            pass
+        try:
+            select.select_by_value(text_value)
+            return
+        except Exception:
+            pass
+        for option in select.options:
+            if text_value in (option.text or ""):
+                select.select_by_visible_text(option.text)
+                return
+        LOGGER.warning("Option '%s' not found for field '%s'", text_value, field)
+
+    def _set_walk_unit(self, label: str, occurrence: int = 0, index: int = 0) -> None:
+        try:
+            select_el = self._find_input_by_label(
+                label,
+                tag="select",
+                occurrence=occurrence,
+                index=index,
+                wait=False,
+            )
+        except Exception:
+            return
+        try:
+            Select(select_el).select_by_value("1")
+        except Exception:
+            try:
+                Select(select_el).select_by_visible_text("分")
+            except Exception:
+                LOGGER.debug("Failed to fix walk unit select to '分'")
+
+    def _apply_radio_option(self, field: str, value: object) -> None:
+        mapping = RADIO_OPTIONS[field]
+        key = str(value).strip()
+        candidates = {
+            key,
+            key.replace(" ", ""),
+            key.translate(str.maketrans("０１２３４５６７８９", "0123456789")),
+        }
+        target = None
+        for cand in candidates:
+            if cand in mapping:
+                target = mapping[cand]
+                break
+        if not target:
+            LOGGER.warning("Radio option '%s' is not defined for field '%s'", value, field)
+            return
+
+        xpath = (
+            "//label[contains(@class,'custom-control-label') and normalize-space()='%s']" % target
+        )
+        try:
+            label_el = self.wait.until(EC.element_to_be_clickable((By.XPATH, xpath)))
+        except TimeoutException:
+            LOGGER.warning("Radio label '%s' not found for field '%s'", target, field)
+            self._dump_dom(f"missing_radio_{field}")
+            return
+        try:
+            self.driver.execute_script("arguments[0].click();", label_el)
+        except Exception:
+            label_el.click()
+
+    def _apply_checkbox_option(self, config: Dict[str, Sequence[str]], value: object, field: str) -> None:
+        desired = bool(value)
+        checkbox = None
+        label_el = None
+
+        if "selectors" in config:
+            checkbox = self._find_element_by_selectors(config["selectors"], wait=False)
+
+        if checkbox is None and "label" in config:
+            try:
+                checkbox, label_el = self._find_checkbox_by_label(
+                    config["label"], config.get("occurrence", 0)
+                )
+            except TimeoutException:
+                checkbox = None
+                label_el = None
+
+        if checkbox is None:
+            LOGGER.warning("Checkbox input not found for field '%s'", field)
+            self._dump_dom(f"missing_checkbox_{field}")
+            return
+
+        self._set_checkbox_state(checkbox, desired, label_el)
+
+    def _set_checkbox_state(self, checkbox, desired: bool, label_el=None) -> None:
+        if bool(checkbox.is_selected()) == desired:
+            return
+        target = label_el or checkbox
+        try:
+            self.driver.execute_script("arguments[0].click();", target)
+        except Exception:
+            target.click()
+
+    def _find_input_by_label(
+        self,
+        label: str,
+        *,
+        tag: str = "input",
+        occurrence: int = 0,
+        index: int = 0,
+        wait: bool = True,
+    ):
+        base = (label or "").strip()
+        if not base:
+            raise TimeoutException("Empty label")
+
+        variants = [
+            base,
+            base.replace(" ", ""),
+            base.replace("　", ""),
+            base.translate(str.maketrans("０１２３４５６７８９", "0123456789")),
+        ]
+
+        label_el = None
+        def resolve_label(driver):
+            nonlocal label_el
+            for text in variants:
+                xpath_exact = f"//span[contains(@class,'p-label-title') and normalize-space()='{text}']"
+                nodes = driver.find_elements(By.XPATH, xpath_exact)
+                if len(nodes) > occurrence:
+                    return nodes[occurrence]
+            for text in variants:
+                xpath_contains = f"//span[contains(@class,'p-label-title') and contains(normalize-space(), '{text}')]"
+                nodes = driver.find_elements(By.XPATH, xpath_contains)
+                if len(nodes) > occurrence:
+                    return nodes[occurrence]
+            return None
+
+        if wait:
+            label_el = self.wait.until(lambda d: resolve_label(d))
+        else:
+            label_el = resolve_label(self.driver)
+
+        if label_el is None:
+            raise TimeoutException(f"Label '{label}' not found")
+
+        search_xpaths = [
+            f"./following-sibling::*//{tag}",
+            f"./parent::*/following-sibling::*//{tag}",
+            f"./ancestor::div[contains(@class,'row')][1]//{tag}",
+            f"./ancestor::div[contains(@class,'col')][1]//{tag}",
+            f"./ancestor::div[contains(@class,'form-group')][1]//{tag}",
+            f".//{tag}",
+            f"./following::*//{tag}",
+        ]
+
+        candidates: List = []
+        for xp in search_xpaths:
+            try:
+                elements = label_el.find_elements(By.XPATH, xp)
+            except Exception:
+                continue
+            for el in elements:
+                if el.tag_name.lower() != tag.lower():
+                    continue
+                if el not in candidates:
+                    candidates.append(el)
+        if not candidates or len(candidates) <= index:
+            raise TimeoutException(f"No {tag} found near label '{label}' (index {index})")
+
+        visible = [el for el in candidates if el.is_displayed()]
+        if visible and len(visible) > index:
+            return visible[index]
+        return candidates[index]
+
+    def _find_checkbox_by_label(self, label: str, occurrence: int = 0):
+        base = (label or "").strip()
+        variants = [
+            base,
+            base.replace(" ", ""),
+            base.replace("　", ""),
+            base.translate(str.maketrans("０１２３４５６７８９", "0123456789")),
+        ]
+
+        def resolve(driver):
+            for text in variants:
+                xpath = f"//label[contains(@class,'custom-control-label') and normalize-space()='{text}']"
+                nodes = driver.find_elements(By.XPATH, xpath)
+                if len(nodes) > occurrence:
+                    return nodes[occurrence]
+            for text in variants:
+                xpath = f"//label[contains(@class,'custom-control-label') and contains(normalize-space(),'{text}')]"
+                nodes = driver.find_elements(By.XPATH, xpath)
+                if len(nodes) > occurrence:
+                    return nodes[occurrence]
+            return None
+
+        label_el = self.wait.until(lambda d: resolve(d))
+        if label_el is None:
+            return None, None
+
+        input_id = label_el.get_attribute("for")
+        checkbox = None
+        if input_id:
+            try:
+                checkbox = self.driver.find_element(By.ID, input_id)
+            except Exception:
+                checkbox = None
+        if checkbox is None:
+            try:
+                checkbox = label_el.find_element(By.XPATH, "./preceding-sibling::input[@type='checkbox'][1]")
+            except Exception:
+                checkbox = None
+
+        return checkbox, label_el
+
+    def _dump_dom(self, suffix: str) -> None:
+        try:
+            path = Path(tempfile.gettempdir()) / f"reins_dom_{suffix}_{int(time.time())}.html"
+            path.write_text(self.driver.page_source, encoding="utf-8")
+            LOGGER.debug("Saved DOM snapshot: %s", path)
+        except Exception:
+            LOGGER.debug("Failed to dump DOM snapshot for %s", suffix, exc_info=True)
 
     def _extract_details(self) -> Dict[str, str]:
         """詳細画面のラベル/値を抽出。"""

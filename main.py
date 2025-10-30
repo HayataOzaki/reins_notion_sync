@@ -47,6 +47,9 @@ def main() -> None:
     reins_id = os.environ["REINS_ID"]
     reins_password = os.environ["REINS_PASSWORD"]
 
+    headless_env = os.getenv("REINS_HEADLESS", "true").strip().lower()
+    headless = headless_env not in {"0", "false", "no"}
+
     mapper = DataMapper(base_path)
     notion = NotionIntegration(notion_token, search_db_id, property_db_id)
     credentials = ReinsCredentials(username=reins_id, password=reins_password)
@@ -56,8 +59,9 @@ def main() -> None:
         logging.getLogger("reins").info("No pending search jobs found")
         return
 
-    with ReinsScraper(credentials) as scraper:
+    with ReinsScraper(credentials, headless=headless) as scraper:
         scraper.login()
+        scraper.go_to_rental_search()
         for job in jobs:
             try:
                 process_search_job(job, scraper, mapper, notion)
