@@ -12,9 +12,11 @@ from typing import Dict, List, Optional, Sequence
 import httpx
 from selenium.webdriver import Chrome, ChromeOptions
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.remote.webdriver import WebDriver
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import Select, WebDriverWait
+from selenium.common.exceptions import StaleElementReferenceException, TimeoutException
 
 LOGGER = logging.getLogger("scraper")
 
@@ -59,12 +61,12 @@ FIELD_CONFIG: Dict[str, Dict[str, object]] = {
         "index": 0,
         "unit_index": 0,
     },
-    "築年": {"label": "築年月", "type": "select", "index": 0},
+    "築年数上限": {"label": "築年月", "type": "select", "index": 0},
     "駐車場の有無": {"label": "駐車場の有無", "type": "select"},
 }
 
 RADIO_OPTIONS: Dict[str, Dict[str, str]] = {
-    "登録日": {
+    "登録年月日": {
         "指定なし": "指定なし(全期間)",
         "全期間": "指定なし(全期間)",
         "当日": "当日",
@@ -82,8 +84,9 @@ RADIO_OPTIONS: Dict[str, Dict[str, str]] = {
 }
 
 CHECKBOX_CONFIG: Dict[str, Dict[str, object]] = {
-    "新築": {"label": "新築"},
-    "角部屋": {"label": "角部屋"},
+    "新築フラグ": {"label": "新築"},
+    "角部屋フラグ": {"label": "角部屋"},
+    "ペット可": {"label": "ペット"},
 }
 
 
@@ -305,9 +308,8 @@ class ReinsScraper:
     def set_conditions(self, conditions: Dict[str, object]) -> None:
         """検索条件を設定。Notion→REINSマッピングで対応。"""
         LOGGER.info("Applying %d search conditions", len(conditions))
-        self._reset_form()
-
         for field, value in conditions.items():
+            self._human_pause(0.15, 0.35)
             self._apply_condition(field, value)
 
     def run_search(self, max_results: int = 50) -> List[ReinsSearchResult]:
@@ -330,9 +332,26 @@ class ReinsScraper:
         )
 
         results: List[ReinsSearchResult] = []
-        for idx, button in enumerate(detail_buttons[:max_results], start=1):
+        for idx in range(min(max_results, len(detail_buttons))):
+            detail_buttons = self.driver.find_elements(By.CSS_SELECTOR, DETAIL_BUTTON_SELECTOR)
+            if idx >= len(detail_buttons):
+                break
+            button = detail_buttons[idx]
             try:
+                self.wait.until(EC.element_to_be_clickable(button))
                 self.driver.execute_script("arguments[0].click();", button)
+            except StaleElementReferenceException:
+                detail_buttons = self.driver.find_elements(By.CSS_SELECTOR, DETAIL_BUTTON_SELECTOR)
+                if idx >= len(detail_buttons):
+                    LOGGER.warning("Detail button %d disappeared; skipping", idx)
+                    continue
+                button = detail_buttons[idx]
+                self.driver.execute_script("arguments[0].click();", button)
+            except Exception:
+                LOGGER.warning("Failed to click detail button %d; skipping", idx, exc_info=True)
+                continue
+
+            try:
                 self._wait_for_detail_view()
 
                 details = self._extract_details()
@@ -341,7 +360,7 @@ class ReinsScraper:
                 results.append(ReinsSearchResult(details=details, pdf_path=pdf_path))
                 LOGGER.info(
                     "✅ Result %d collected (fields=%d, pdf=%s)",
-                    idx,
+                    idx + 1,
                     len(details),
                     "yes" if pdf_path else "no",
                 )
@@ -360,64 +379,45 @@ class ReinsScraper:
             LOGGER.debug("Empty value for %s, skipping", field)
             return
 
-        key = FIELD_ALIASES.get(field, field)
-
         # ラジオボタン（登録年月日など）
-        if key in RADIO_OPTIONS:
-            self._apply_radio_option(key, value)
+        if field in RADIO_OPTIONS:
+            self._apply_radio_option(field, value)
             return
 
         # チェックボックス
-        checkbox_cfg = CHECKBOX_CONFIG.get(key)
+        checkbox_cfg = CHECKBOX_CONFIG.get(field)
         if checkbox_cfg:
-            self._apply_checkbox_option(checkbox_cfg, value, key)
+            self._apply_checkbox_option(checkbox_cfg, value, field)
             return
 
-        config = FIELD_CONFIG.get(key)
+        config = FIELD_CONFIG.get(field)
         if not config:
-            LOGGER.debug("No mapping defined for '%s'", key)
+            LOGGER.debug("No mapping defined for '%s'", field)
             return
 
-        element = self._locate_field_element(key, config)
+        element = self._locate_field_element(field, config)
         if element is None:
-            LOGGER.warning("Field '%s' could not be located; skipping value %s", key, value)
-            self._dump_dom(f"missing_field_{key}")
+            LOGGER.warning("Field '%s' could not be located; skipping value %s", field, value)
+            self._dump_dom(f"missing_field_{field}")
             return
 
         field_type = config.get("type", "text")
         if field_type == "select":
-            self._select_option(element, value, key)
+            self._select_option(element, value, field)
+            self._human_pause(0.15, 0.3)
         else:
             element.clear()
             element.send_keys(self._format_input_value(value))
+            self._human_pause(0.15, 0.3)
+            try:
+                element.send_keys(Keys.TAB)
+            except Exception:
+                LOGGER.debug("Failed to advance focus after setting %s", field, exc_info=True)
 
         if config.get("unit_index") is not None:
-            label = config.get("label", key)
+            label = config.get("label", field)
             occurrence = config.get("occurrence", 0)
             self._set_walk_unit(label, occurrence, config.get("unit_index", 0))
-
-    def _reset_form(self) -> None:
-        """主要項目を初期化。"""
-        for key, config in FIELD_CONFIG.items():
-            element = self._locate_field_element(key, config, wait=False)
-            if element is None:
-                continue
-            tag = (element.tag_name or "").lower()
-            field_type = config.get("type", "text")
-            if field_type == "select" or tag == "select":
-                try:
-                    Select(element).select_by_index(0)
-                except Exception:
-                    continue
-            else:
-                try:
-                    element.clear()
-                except Exception:
-                    continue
-            if config.get("unit_index") is not None:
-                label = config.get("label", key)
-                occurrence = config.get("occurrence", 0)
-                self._set_walk_unit(label, occurrence, config.get("unit_index", 0))
 
     @staticmethod
     def _format_input_value(value: object) -> str:
@@ -556,6 +556,7 @@ class ReinsScraper:
             self.driver.execute_script("arguments[0].click();", target)
         except Exception:
             target.click()
+        self._human_pause(0.12, 0.25)
 
     def _find_input_by_label(
         self,
@@ -767,6 +768,14 @@ class ReinsScraper:
         options.add_argument("--lang=ja-JP")
         driver = Chrome(options=options)
         return driver
+
+    @staticmethod
+    def _human_pause(min_s: float, max_s: float) -> None:
+        try:
+            duration = (float(min_s) + float(max_s)) / 2.0
+        except Exception:
+            duration = max_s
+        time.sleep(max(0.0, duration))
 
 
 __all__ = ["ReinsScraper", "ReinsCredentials", "ReinsSearchResult"]

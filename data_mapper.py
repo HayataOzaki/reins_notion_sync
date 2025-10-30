@@ -23,7 +23,7 @@ class PropertyMapping:
 
 
 SEARCH_MAPPINGS: List[SearchMapping] = [
-    SearchMapping("登録日", "登録日", "select"),
+    SearchMapping("登録日", "登録年月日", "select"),
     SearchMapping("物件種別", "物件種別", "select"),
     SearchMapping("物件種目", "物件種目", "select"),
     SearchMapping("沿線名", "沿線名", "text"),
@@ -54,6 +54,10 @@ PROPERTY_MAPPINGS: List[PropertyMapping] = [
 
 class DataMapper:
     """Provides in-code mapping definitions between Notion and REINS."""
+
+    def __init__(self, base_path: Optional[object] = None) -> None:
+        # base_path は後方互換のために受け取るが使用しない
+        self.base_path = base_path
 
     def get_reins_field(self, notion_column: str) -> Optional[SearchMapping]:
         notion_column = notion_column.strip()
