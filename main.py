@@ -25,15 +25,21 @@ def configure_logging(base_path: Path) -> None:
 
     scraper_handler = logging.FileHandler(logs_dir / "scraper.log")
     scraper_handler.setFormatter(formatter)
-    logging.getLogger("scraper").addHandler(scraper_handler)
+    scraper_logger = logging.getLogger("scraper")
+    scraper_logger.setLevel(logging.DEBUG)
+    scraper_logger.addHandler(scraper_handler)
 
     reins_handler = logging.FileHandler(logs_dir / "reins_to_notion.log")
     reins_handler.setFormatter(formatter)
-    logging.getLogger("reins").addHandler(reins_handler)
+    reins_logger = logging.getLogger("reins")
+    reins_logger.setLevel(logging.DEBUG)
+    reins_logger.addHandler(reins_handler)
 
     notion_handler = logging.FileHandler(logs_dir / "notion_upload.log")
     notion_handler.setFormatter(formatter)
-    logging.getLogger("notion").addHandler(notion_handler)
+    notion_logger = logging.getLogger("notion")
+    notion_logger.setLevel(logging.DEBUG)
+    notion_logger.addHandler(notion_handler)
 
 
 def main() -> None:
@@ -87,7 +93,12 @@ def process_search_job(job: NotionSearchJob, scraper: ReinsScraper, mapper: Data
         property_payload = mapper.map_property_details(result.details)
         if not property_payload:
             continue
-        page_id = notion.upsert_property(property_payload, result.pdf_path)
+        logger.debug("Property payload keys: %s", list(property_payload.keys())[:15])
+        sample_items = list(property_payload.items())[:5]
+        logger.debug("Property payload sample: %s", sample_items)
+        pdf_path = result.pdf_path
+        property_payload.pop("図面ファイル", None)
+        page_id = notion.upsert_property(property_payload, pdf_path)
         if page_id:
             property_ids.append(page_id)
 

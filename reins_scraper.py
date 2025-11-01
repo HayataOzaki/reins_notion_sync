@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import logging
+import os
+import re
 import tempfile
 import time
+from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Set
+import unicodedata
 
 import httpx
 from selenium.webdriver import Chrome, ChromeOptions
@@ -16,7 +20,12 @@ from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.remote.webdriver import WebDriver
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import Select, WebDriverWait
-from selenium.common.exceptions import StaleElementReferenceException, TimeoutException
+from selenium.common.exceptions import (
+    ElementClickInterceptedException,
+    NoSuchElementException,
+    StaleElementReferenceException,
+    TimeoutException,
+)
 
 LOGGER = logging.getLogger("scraper")
 
@@ -38,6 +47,15 @@ RENTAL_SEARCH_BUTTON_SELECTOR = "button.btn.p-button.btn-primary.btn-block.px-0"
 SEARCH_BUTTON_TEXT = "検索"
 DETAIL_BUTTON_SELECTOR = "button.btn.p-button.m-0.py-0.btn-outline.btn-block.px-0"
 RENTAL_SEARCH_URL_FRAGMENT = "GBK001310"
+UNIQUE_LABELS = {
+    "物件番号",
+    "登録年月日",
+    "更新年月日",
+    "変更年月日",
+    "物件種目",
+    "広告転載区分",
+    "新築フラグ",
+}
 
 # フィールドマッピング（ラベルベース）
 FIELD_CONFIG: Dict[str, Dict[str, object]] = {
@@ -112,10 +130,30 @@ class ReinsScraper:
         *,
         headless: bool = True,
         wait_timeout: int = 30,
+        download_pdf: Optional[bool] = None,
     ) -> None:
         self.credentials = credentials
-        self.driver = driver or self._create_driver(headless=headless)
+        default_download = Path.home() / "Desktop" / "物件PDF"
+        self.browser_download_dir = Path(
+            os.getenv("REINS_BROWSER_DOWNLOAD_DIR", default_download)
+        ).expanduser().resolve()
+        try:
+            self.browser_download_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            LOGGER.warning(
+                "Failed to ensure download directory exists: %s", self.browser_download_dir, exc_info=True
+            )
+        self.driver = driver or self._create_driver(headless=headless, download_dir=self.browser_download_dir)
         self.wait = WebDriverWait(self.driver, wait_timeout)
+        flag = os.getenv("REINS_DOWNLOAD_PDF") if download_pdf is None else None
+        if download_pdf is None:
+            if flag is None:
+                download_pdf = True
+            else:
+                download_pdf = flag.strip().lower() in {"1", "true", "yes", "on"}
+        self.download_pdf = download_pdf
+        self.detail_wait_seconds = max(2, min(wait_timeout, 10))
+        self._configure_download_behavior()
 
     # ------------------------------------------------------------------
     # Context manager helpers
@@ -327,35 +365,64 @@ class ReinsScraper:
         self.driver.execute_script("arguments[0].click();", search_button)
         LOGGER.info("Collecting search results...")
 
-        detail_buttons = self.wait.until(
-            EC.presence_of_all_elements_located((By.CSS_SELECTOR, DETAIL_BUTTON_SELECTOR))
-        )
+        detail_buttons: List[WebElement] = []
+        for _ in range(40):
+            detail_buttons = self.driver.find_elements(By.CSS_SELECTOR, DETAIL_BUTTON_SELECTOR)
+            if detail_buttons:
+                break
+            self._human_pause(0.25, 0.5)
+        if not detail_buttons:
+            LOGGER.debug("No detail buttons found after wait; dumping DOM for diagnostics")
+            self._dump_dom("detail_buttons_missing")
+            raise RuntimeError("検索結果の詳細ボタンが見つかりませんでした。")
 
         results: List[ReinsSearchResult] = []
-        for idx in range(min(max_results, len(detail_buttons))):
-            detail_buttons = self.driver.find_elements(By.CSS_SELECTOR, DETAIL_BUTTON_SELECTOR)
-            if idx >= len(detail_buttons):
-                break
-            button = detail_buttons[idx]
-            try:
-                self.wait.until(EC.element_to_be_clickable(button))
-                self.driver.execute_script("arguments[0].click();", button)
-            except StaleElementReferenceException:
-                detail_buttons = self.driver.find_elements(By.CSS_SELECTOR, DETAIL_BUTTON_SELECTOR)
-                if idx >= len(detail_buttons):
-                    LOGGER.warning("Detail button %d disappeared; skipping", idx)
-                    continue
-                button = detail_buttons[idx]
-                self.driver.execute_script("arguments[0].click();", button)
-            except Exception:
-                LOGGER.warning("Failed to click detail button %d; skipping", idx, exc_info=True)
-                continue
+        if self._click_detail_button(0) != "clicked":
+            LOGGER.warning("Failed to open first detail view; aborting result collection")
+            return results
+
+        self._wait_for_detail_view()
+        detail_open = True
+        current_property_number: Optional[str] = None
+        count = min(max_results, len(detail_buttons))
+        idx = 0
+        while idx < count:
+            if idx > 0:
+                if not self._go_to_next_property(current_property_number):
+                    LOGGER.info("「次の物件」ボタンが見つからないため処理を終了します (収集済み %d 件)", len(results))
+                    break
 
             try:
-                self._wait_for_detail_view()
-
                 details = self._extract_details()
-                pdf_path = self._download_pdf_if_available()
+                LOGGER.debug("Detail keys extracted (sample): %s", list(details.keys())[:12])
+                if not details:
+                    LOGGER.warning("Result %d produced no details; skipping", idx + 1)
+                    current_property_number = None
+                    idx += 1
+                    continue
+
+                property_number = self._resolve_detail_value(
+                    details, ["物件番号", "物件番号@1", "物件番号@2"]
+                )
+                if not property_number:
+                    LOGGER.warning("Result %d missing property number; skipping", idx + 1)
+                    current_property_number = None
+                    idx += 1
+                    continue
+
+                current_property_number = property_number
+
+                pdf_path: Optional[Path] = None
+                if self.download_pdf:
+                    base_name = self._build_pdf_basename(details, property_number)
+                    if base_name:
+                        pdf_path = self._download_pdf_if_available(base_name)
+                        if pdf_path:
+                            LOGGER.debug("Downloaded floor plan for %s → %s", property_number, pdf_path.name)
+                        else:
+                            LOGGER.debug("PDF download skipped or failed for %s", property_number)
+                    else:
+                        LOGGER.debug("PDF base name unavailable for property %s; skipping download", property_number)
 
                 results.append(ReinsSearchResult(details=details, pdf_path=pdf_path))
                 LOGGER.info(
@@ -364,8 +431,16 @@ class ReinsScraper:
                     len(details),
                     "yes" if pdf_path else "no",
                 )
-            finally:
+            except Exception:
+                LOGGER.warning("Failed to collect details for result %d", idx + 1, exc_info=True)
                 self._close_detail_view()
+                detail_open = False
+                break
+
+            idx += 1
+
+        if detail_open:
+            self._close_detail_view()
 
         LOGGER.info("✅ Collected %d result(s)", len(results))
         return results
@@ -682,90 +757,338 @@ class ReinsScraper:
     def _extract_details(self) -> Dict[str, str]:
         """詳細画面のラベル/値を抽出。"""
         details: Dict[str, str] = {}
-        rows = self.driver.find_elements(By.CSS_SELECTOR, "div.detail-row")
-        if not rows:
-            rows = self.driver.find_elements(By.CSS_SELECTOR, "div.row")
+        seen_counts: Dict[str, int] = {}
 
-        for row in rows:
-            try:
-                label = ""
-                value = ""
-                for sel in (".label", ".col-3", ".col-sm-3"):
-                    els = row.find_elements(By.CSS_SELECTOR, sel)
-                    if els:
-                        label = els[0].text.strip()
-                        break
-                for sel in (".col", ".col-9", ".col-sm-9"):
-                    els = row.find_elements(By.CSS_SELECTOR, sel)
-                    if els:
-                        value = els[0].text.strip()
-                        break
-                if label:
-                    details[label] = value
-            except Exception:
+        try:
+            WebDriverWait(self.driver, self.detail_wait_seconds).until(
+                lambda drv: drv.find_elements(By.CSS_SELECTOR, "span.p-label-title")
+            )
+        except TimeoutException:
+            LOGGER.debug("Detail labels not detected; dumping DOM")
+            self._dump_dom("detail_labels_missing")
+            return details
+
+        label_elements = self.driver.find_elements(By.CSS_SELECTOR, "span.p-label-title")
+        for span in label_elements:
+            label = (span.text or "").strip()
+            if not label:
                 continue
+            try:
+                block = span.find_element(By.XPATH, "./ancestor::div[contains(@class, 'col')][1]")
+            except Exception:
+                try:
+                    block = span.find_element(By.XPATH, "./ancestor::div[contains(@class, 'container')][1]")
+                except Exception:
+                    continue
+
+            block_text = (block.text or "").strip()
+            value_text = block_text.replace(label, "", 1).strip() if block_text else ""
+            value_nodes = block.find_elements(By.CSS_SELECTOR, "div.row div")
+            values = [node.text.strip() for node in value_nodes if node.text.strip()]
+            if not value_text and values:
+                value_text = " ".join(values).strip()
+
+            value_text = value_text.replace("\n", " ").strip()
+            if label.startswith("物件番号"):
+                LOGGER.debug("Extracted value for %s: %r", label, value_text)
+
+            base_label = label.split()[0]
+            is_unique = base_label in UNIQUE_LABELS
+            store_label = "更新年月日" if base_label == "変更年月日" else base_label
+            if is_unique:
+                candidate = (value_text or (values[0] if values else "")).strip()
+                if candidate:
+                    details.setdefault(store_label, candidate)
+                continue
+
+            seen_counts[label] = seen_counts.get(label, 0) + 1
+            key = label
+            if key in details:
+                key = f"{label}#{seen_counts[label]}"
+            details[key] = value_text
+
+            if values:
+                for idx, part in enumerate(values, 1):
+                    sub_key = f"{key}@{idx}"
+                    details[sub_key] = part
+
         return details
 
-    def _download_pdf_if_available(self) -> Optional[Path]:
+    def _download_pdf_if_available(self, base_name: str) -> Optional[Path]:
         """『図面参照』PDFがあれば保存。"""
+        sanitized_name = self._sanitize_filename(base_name)
+        if not sanitized_name:
+            return None
+        button_xpath = "//button[contains(@class,'p-button') and contains(normalize-space(.),'図面参照')]"
         button = None
-        for sel in ("button.btn.p-button.btn-outline", "button.btn.p-button"):
-            for b in self.driver.find_elements(By.CSS_SELECTOR, sel):
-                if "図面参照" in (b.text or "").strip():
-                    button = b
-                    break
-            if button:
+        for attempt in range(4):
+            try:
+                button = self.driver.find_element(By.XPATH, button_xpath)
                 break
-
-        if not button:
+            except NoSuchElementException:
+                self._human_pause(0.2, 0.4)
+        if button is None:
+            LOGGER.debug("Floor plan button not found; skipping PDF download")
             return None
 
-        pdf_url = button.get_attribute("data-url") or button.get_attribute("href")
+        pdf_url: Optional[str] = None
+        for attempt in range(4):
+            try:
+                pdf_url = (button.get_attribute("data-url") or button.get_attribute("href") or "").strip()
+                if pdf_url:
+                    break
+            except StaleElementReferenceException:
+                button = self.driver.find_element(By.XPATH, button_xpath)
         if not pdf_url:
-            self.driver.execute_script("arguments[0].click();", button)
-            pdf_url = button.get_attribute("data-url") or button.get_attribute("href")
+            onclick = button.get_attribute("onclick") or ""
+            match = re.search(r"'(https?://[^']+\\.pdf[^']*)'", onclick) or re.search(
+                r'"(https?://[^"]+\\.pdf[^"]*)"', onclick
+            )
+            if match:
+                pdf_url = match.group(1)
         if not pdf_url:
-            return None
+            LOGGER.debug("Floor plan URL not exposed; using browser download workflow")
+            return self._download_pdf_via_browser(button, sanitized_name)
 
+        return self._download_pdf_via_http(pdf_url, sanitized_name)
+
+    def _download_pdf_via_http(self, pdf_url: str, sanitized_name: str) -> Optional[Path]:
         try:
             cookies = {c["name"]: c["value"] for c in self.driver.get_cookies()}
             resp = httpx.get(pdf_url, timeout=30.0, cookies=cookies)
             resp.raise_for_status()
         except Exception as exc:
-            LOGGER.warning("Failed to download PDF: %s", exc)
+            LOGGER.warning("Failed to download PDF via HTTP: %s", exc)
             return None
 
-        tmp_dir = Path(tempfile.mkdtemp(prefix="reins_pdf_"))
-        pdf_path = tmp_dir / "floorplan.pdf"
-        pdf_path.write_bytes(resp.content)
-        return pdf_path
+        dest = self.browser_download_dir / f"{sanitized_name}.pdf"
+        dest.write_bytes(resp.content)
+        LOGGER.debug("PDF fetched via HTTP → %s", dest)
+        return dest
+
+    def _download_pdf_via_browser(self, button: WebElement, sanitized_name: str) -> Optional[Path]:
+        before = {p.name for p in self.browser_download_dir.glob("*")}
+        try:
+            button.click()
+        except Exception:
+            try:
+                self.driver.execute_script("arguments[0].click();", button)
+            except Exception:
+                LOGGER.warning("Failed to trigger PDF download via browser")
+                return None
+
+        downloaded = self._wait_for_browser_download(before, sanitized_name)
+        if not downloaded:
+            return None
+        return downloaded
+
+    def _go_to_next_property(self, previous_property_number: Optional[str]) -> bool:
+        buttons = self.driver.find_elements(
+            By.XPATH, "//button[contains(@class,'p-button') and contains(normalize-space(.),'次の物件')]"
+        )
+        target = None
+        for btn in buttons:
+            if "次の物件" in (btn.text or ""):
+                target = btn
+                break
+        if target is None:
+            return False
+
+        try:
+            self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", target)
+        except Exception:
+            pass
+
+        try:
+            target.click()
+        except Exception:
+            try:
+                self.driver.execute_script("arguments[0].click();", target)
+            except Exception:
+                LOGGER.debug("Failed to click '次の物件' button", exc_info=True)
+                return False
+
+        def number_changed(_: WebDriver) -> bool:
+            current = self._get_property_number()
+            return bool(current) and current != previous_property_number
+
+        try:
+            if previous_property_number:
+                WebDriverWait(self.driver, self.detail_wait_seconds).until(number_changed)
+            else:
+                self._wait_for_detail_view()
+        except TimeoutException:
+            LOGGER.debug("Property number did not change after clicking '次の物件'")
+            return False
+        return True
+
+    def _get_property_number(self) -> Optional[str]:
+        try:
+            block = self.driver.find_element(
+                By.XPATH,
+                "//span[contains(@class,'p-label-title') and contains(normalize-space(),'物件番号')]/ancestor::div[contains(@class,'col')][1]",
+            )
+        except NoSuchElementException:
+            return None
+        text = (block.text or "").strip()
+        return text.replace("物件番号", "", 1).strip()
+
+    def _build_pdf_basename(self, details: Dict[str, str], property_number: Optional[str]) -> Optional[str]:
+        building = self._resolve_detail_value(details, ["建物名", "建物名@1", "建物名#1"])
+        room = self._resolve_detail_value(details, ["部屋番号", "部屋番号@1", "部屋番号@2"])
+        fallback = self._sanitize_filename(property_number or "")
+        date_str = datetime.now().strftime("%Y%m%d")
+
+        sanitized_building = self._sanitize_filename(building) if building else ""
+        sanitized_room = self._sanitize_filename(room) if room else ""
+
+        if sanitized_room and sanitized_room == "部屋番号":
+            sanitized_room = ""
+
+        if sanitized_building and sanitized_room:
+            return f"{sanitized_building}{sanitized_room}_{date_str}"
+        if sanitized_building:
+            return f"{sanitized_building}_{date_str}"
+        if fallback:
+            return f"{fallback}_{date_str}"
+        return None
+
+    @staticmethod
+    def _resolve_detail_value(details: Dict[str, str], keys: Sequence[str]) -> Optional[str]:
+        for key in keys:
+            value = details.get(key)
+            if value:
+                text = str(value).strip()
+                if text:
+                    return text
+        return None
+
+    @staticmethod
+    def _sanitize_filename(value: str) -> str:
+        text = unicodedata.normalize("NFKC", str(value))
+        text = text.replace(" ", "").replace("　", "")
+        text = re.sub(r"[\\/:*?\"<>|\r\n]", "_", text)
+        return text.strip("_")
+
+    def _configure_download_behavior(self) -> None:
+        try:
+            self.driver.execute_cdp_cmd(
+                "Page.setDownloadBehavior",
+                {
+                    "behavior": "allow",
+                    "downloadPath": str(self.browser_download_dir),
+                },
+            )
+        except Exception:
+            LOGGER.debug("Failed to configure download behavior via CDP", exc_info=True)
+
+    def _wait_for_browser_download(self, before: Set[str], sanitized_name: str) -> Optional[Path]:
+        deadline = time.time() + 40.0
+        target_name = f"{sanitized_name}.pdf"
+        while time.time() < deadline:
+            new_files = [
+                p
+                for p in self.browser_download_dir.glob("*")
+                if p.name not in before and not p.name.endswith(".crdownload")
+            ]
+            if new_files:
+                latest = max(new_files, key=lambda p: p.stat().st_mtime)
+                if latest.name != target_name:
+                    dest = latest.with_name(target_name)
+                    try:
+                        if dest.exists():
+                            dest.unlink()
+                        latest.rename(dest)
+                        latest = dest
+                    except Exception:
+                        LOGGER.debug("Failed to rename downloaded PDF; using original name", exc_info=True)
+                        return latest
+                LOGGER.debug("PDF downloaded via browser → %s", latest)
+                return latest
+            time.sleep(0.3)
+        LOGGER.warning("Timed out waiting for browser download to finish")
+        return None
 
     def _close_detail_view(self) -> None:
         """詳細を閉じて一覧に戻る。"""
         try:
             close_button = self.driver.find_element(By.CSS_SELECTOR, "button.p-frame-backer")
             self.driver.execute_script("arguments[0].click();", close_button)
-            self.wait.until(
+            WebDriverWait(self.driver, self.detail_wait_seconds).until(
                 EC.presence_of_all_elements_located((By.CSS_SELECTOR, DETAIL_BUTTON_SELECTOR))
             )
+        except TimeoutException:
+            LOGGER.debug("Detail buttons did not reappear in time after closing view")
         except Exception:
-            LOGGER.debug("Failed to close detail view or wait for list")
+            LOGGER.debug("Failed to close detail view or wait for list", exc_info=True)
 
     def _wait_for_detail_view(self) -> None:
         """詳細画面の出現待機。"""
         try:
-            self.wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "button.p-frame-backer")))
+            WebDriverWait(self.driver, self.detail_wait_seconds).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "button.p-frame-backer"))
+            )
         except Exception:
             LOGGER.debug("Detail view did not appear in time")
 
+    def _click_detail_button(self, index: int, *, retries: int = 4) -> str:
+        """検索結果の詳細ボタンをクリック。戻り値は 'clicked' / 'missing' / 'failed'。"""
+        for attempt in range(retries):
+            buttons = self.driver.find_elements(By.CSS_SELECTOR, DETAIL_BUTTON_SELECTOR)
+            if index >= len(buttons):
+                return "missing"
+            button = buttons[index]
+            try:
+                self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", button)
+            except StaleElementReferenceException:
+                LOGGER.debug("Detail button %d stale during scroll (attempt %d)", index, attempt + 1, exc_info=True)
+                self._human_pause(0.1, 0.2)
+                continue
+
+            try:
+                if not button.is_displayed() or not button.is_enabled():
+                    self._human_pause(0.2, 0.4)
+                    continue
+            except StaleElementReferenceException:
+                LOGGER.debug("Detail button %d stale during visibility check (attempt %d)", index, attempt + 1, exc_info=True)
+                continue
+
+            try:
+                button.click()
+                return "clicked"
+            except (StaleElementReferenceException, ElementClickInterceptedException):
+                try:
+                    self.driver.execute_script("arguments[0].click();", button)
+                    return "clicked"
+                except StaleElementReferenceException:
+                    LOGGER.debug("Detail button %d stale during JS click (attempt %d)", index, attempt + 1, exc_info=True)
+                    self._human_pause(0.1, 0.2)
+                    continue
+            except Exception:
+                LOGGER.debug("Detail button %d click failed (attempt %d)", index, attempt + 1, exc_info=True)
+                self._human_pause(0.1, 0.2)
+                continue
+
+            self._human_pause(0.2, 0.4)
+
+        return "failed"
+
     @staticmethod
-    def _create_driver(*, headless: bool) -> WebDriver:
+    def _create_driver(*, headless: bool, download_dir: Path) -> WebDriver:
         options = ChromeOptions()
         if headless:
             options.add_argument("--headless=new")
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--lang=ja-JP")
+        prefs = {
+            "download.default_directory": str(download_dir),
+            "download.prompt_for_download": False,
+            "download.directory_upgrade": True,
+            "safebrowsing.enabled": True,
+            "profile.default_content_setting_values.automatic_downloads": 1,
+        }
+        options.add_experimental_option("prefs", prefs)
         driver = Chrome(options=options)
         return driver
 
